@@ -3,7 +3,7 @@
 基于 [iflow-bot](https://github.com/iflowai/iflow-bot) v0.4.6 的 fork，修复了压缩机制和跨渠道会话问题。
 
 > 原项目作者：**Loki** / iFlow Team（MIT License）
-> Fork 维护：**李不是狼** & **119（妖妖酒）**
+> Fork 维护：**李不是狼** & **妖妖酒（119）**
 
 ---
 
