@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card glass">
+  <h3 data-i18n="conv.title">全渠道对话</h3>
+  <form method="get" class="filters">
+    {% if token %}<input type="hidden" name="token" value="{{ token }}">{% endif %}
+    <select name="channel">
+      <option value="" data-i18n="conv.all_channels">全部渠道</option>
+      {% for name in channel_names %}
+      <option value="{{ name }}" {{ 'selected' if channel == name else '' }}>{{ name }}</option>
+      {% endfor %}
+    </select>
+    <input type="text" name="keyword" placeholder="搜索 chat_id 或最后消息..." data-i18n-placeholder="conv.search_placeholder" value="{{ keyword }}">
+    <button type="submit" data-i18n="common.filter">筛选</button>
+  </form>
+  <table class="table">
+    <thead>
+      <tr><th data-i18n="common.channel">渠道</th><th>Chat ID</th><th data-i18n="common.messages">消息数</th><th data-i18n="conv.last_time">最后时间</th><th data-i18n="conv.last_message">最后消息</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td><span class="tag">{{ item.channel }}</span></td>
+        <td>{{ item.chat_id }}</td>
+        <td>{{ item.message_count }}</td>
+        <td>{{ item.last_timestamp }}</td>
+        <td>{{ item.last_content }}</td>
+        <td class="action-cell"><a class="btn-mini action-btn" data-i18n="common.view" href="/conversations/{{ item.channel }}/{{ item.file_name }}{% if token %}?token={{ token }}{% endif %}">查看</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

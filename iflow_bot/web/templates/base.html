@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iflow-bot Console</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="bg-gradient"></div>
+  <header class="topbar glass">
+    <div class="brand">✨ iflow-bot Console</div>
+    <nav class="nav">
+      <a data-i18n="nav.dashboard" class="{{ 'active' if page == 'dashboard' else '' }}" href="/{% if token %}?token={{ token }}{% endif %}">仪表盘</a>
+      <a data-i18n="nav.chat" class="{{ 'active' if page == 'chat' else '' }}" href="/chat{% if token %}?token={{ token }}{% endif %}">Web 对话</a>
+      <a data-i18n="nav.conversations" class="{{ 'active' if page == 'conversations' else '' }}" href="/conversations{% if token %}?token={{ token }}{% endif %}">全渠道对话</a>
+      <a data-i18n="nav.config" class="{{ 'active' if page == 'config' else '' }}" href="/config{% if token %}?token={{ token }}{% endif %}">配置中心</a>
+      <a data-i18n="nav.mcp" class="{{ 'active' if page == 'mcp' else '' }}" href="/mcp{% if token %}?token={{ token }}{% endif %}">MCP 代理</a>
+      <a data-i18n="nav.logs" class="{{ 'active' if page == 'logs' else '' }}" href="/logs{% if token %}?token={{ token }}{% endif %}">实时日志</a>
+      <select id="console-lang-switch" class="lang-switch" aria-label="Language">
+        <option value="zh-CN">中文</option>
+        <option value="en-US">English</option>
+      </select>
+    </nav>
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

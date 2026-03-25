@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card glass">
+  <h3 data-i18n="mcp.status_title">MCP 代理状态</h3>
+
+  <div class="status-row">
+    <span class="status-label" data-i18n="mcp.running_status">运行状态:</span>
+    <span id="mcp-running" class="status-badge {{ 'ok' if mcp_status.running else 'bad' }}">
+      {{ '运行中' if mcp_status.running else '已停止' }}
+    </span>
+    <span class="status-label" data-i18n="mcp.pid">PID:</span>
+    <span id="mcp-pid">{{ mcp_status.pid or '-' }}</span>
+  </div>
+
+  <div class="status-row">
+    <span class="status-label" data-i18n="mcp.config_file">配置文件:</span>
+    <span id="mcp-config-file">{{ mcp_status.config_file }}</span>
+  </div>
+
+  <div class="action-row">
+    <button id="btn-mcp-refresh" class="btn btn-primary" data-i18n="mcp.refresh">刷新状态</button>
+    <button id="btn-mcp-restart" class="btn btn-warning" data-i18n="mcp.restart">重启 MCP 代理</button>
+    <button id="btn-mcp-sync" class="btn btn-secondary" data-i18n="mcp.sync">从 iflow 同步</button>
+  </div>
+</section>
+
+<section class="card glass">
+  <h3 data-i18n="mcp.health_check">健康检查</h3>
+  <div id="mcp-health">
+    {% if mcp_status.health.status == 'healthy' %}
+    <span class="status-badge ok" data-i18n="mcp.health_healthy">健康</span>
+    {% elif mcp_status.health.status == 'error' %}
+    <span class="status-badge bad" data-i18n="mcp.health_error">错误</span>
+    <p>{{ mcp_status.health.message or '无法连接到 MCP 代理' }}</p>
+    {% else %}
+    <span class="status-badge" data-i18n="mcp.health_unknown">未知</span>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card glass">
+  <h3 data-i18n="mcp.servers">MCP 服务器配置</h3>
+  <div id="mcp-servers-list">
+    {% if mcp_status.config %}
+    <table class="table">
+      <thead>
+        <tr>
+          <th data-i18n="mcp.server_name">名称</th>
+          <th data-i18n="mcp.server_type">类型</th>
+          <th data-i18n="mcp.server_command">命令</th>
+          <th data-i18n="mcp.server_status">状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for name, server in mcp_status.config.items() %}
+        <tr>
+          <td>{{ name }}</td>
+          <td>{{ server.type or 'stdio' }}</td>
+          <td><code>{{ server.command }} {{ server.args | join(' ') }}</code></td>
+          <td>
+            {% if server.disabled %}
+            <span class="status-badge bad" data-i18n="mcp.disabled">已禁用</span>
+            {% else %}
+            <span class="status-badge ok" data-i18n="mcp.enabled">已启用</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p data-i18n="mcp.no_servers">未配置 MCP 服务器</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card glass">
+  <h3 data-i18n="mcp.discovered_servers">发现的服务</h3>
+  <div id="mcp-discovered">
+    <p data-i18n="mcp.discover_loading">正在加载...</p>
+  </div>
+</section>
+
+<style>
+.status-row { margin: 10px 0; display: flex; align-items: center; gap: 15px; }
+.status-label { font-weight: bold; }
+.status-badge { padding: 4px 12px; border-radius: 12px; font-size: 0.9em; }
+.status-badge.ok { background: #4caf50; color: white; }
+.status-badge.bad { background: #f44336; color: white; }
+.action-row { margin: 15px 0; display: flex; gap: 10px; }
+.btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; }
+.btn-primary { background: #2196f3; color: white; }
+.btn-warning { background: #ff9800; color: white; }
+.btn-secondary { background: #9e9e9e; color: white; }
+.btn:hover { opacity: 0.9; }
+table code { background: rgba(0, 0, 0, 0.3); padding: 2px 6px; border-radius: 3px; font-size: 0.85em; color: #e0e0e0; }
+</style>
+
+<script>
+// MCP 相关的翻译文本
+const MCP_I18N = {
+  'zh-CN': {
+    running: '运行中',
+    stopped: '已停止',
+    healthy: '健康',
+    error: '错误',
+    unknown: '未知',
+    no_servers: '未发现服务',
+    confirm_restart: '确定要重启 MCP 代理吗？',
+    restart_success: '重启成功',
+    restart_failed: '重启失败',
+    sync_success: '同步成功',
+    sync_failed: '同步失败',
+    health_error_message: '无法连接到 MCP 代理',
+  },
+  'en-US': {
+    running: 'Running',
+    stopped: 'Stopped',
+    healthy: 'Healthy',
+    error: 'Error',
+    unknown: 'Unknown',
+    no_servers: 'No servers found',
+    confirm_restart: 'Are you sure to restart MCP Proxy?',
+    restart_success: 'Restarted successfully',
+    restart_failed: 'Restart failed',
+    sync_success: 'Synced successfully',
+    sync_failed: 'Sync failed',
+    health_error_message: 'Cannot connect to MCP Proxy',
+  },
+};
+
+function getMcpText(key) {
+  const lang = _lang || 'zh-CN';
+  return MCP_I18N[lang]?.[key] || MCP_I18N['zh-CN']?.[key] || key;
+}
+
+async function refreshMcpStatus() {
+  try {
+    const resp = await fetch('/api/mcp/status{{ '?token=' + token if token else '' }}');
+    const data = await resp.json();
+    if (data.ok) {
+      const s = data.data;
+      document.getElementById('mcp-running').textContent = s.running ? getMcpText('running') : getMcpText('stopped');
+      document.getElementById('mcp-running').className = 'status-badge ' + (s.running ? 'ok' : 'bad');
+      document.getElementById('mcp-pid').textContent = s.pid || '-';
+      document.getElementById('mcp-config-file').textContent = s.config_file;
+
+      // 健康状态
+      const healthDiv = document.getElementById('mcp-health');
+      if (s.health.status === 'healthy') {
+        healthDiv.innerHTML = '<span class="status-badge ok" data-i18n="mcp.health_healthy">' + getMcpText('healthy') + '</span>';
+      } else if (s.health.status === 'error') {
+        healthDiv.innerHTML = '<span class="status-badge bad" data-i18n="mcp.health_error">' + getMcpText('error') + '</span><p>' + (s.health.message || getMcpText('health_error_message')) + '</p>';
+      } else {
+        healthDiv.innerHTML = '<span class="status-badge" data-i18n="mcp.health_unknown">' + getMcpText('unknown') + '</span>';
+      }
+
+      // 发现的服务
+      const discoveredDiv = document.getElementById('mcp-discovered');
+      if (s.health.servers && s.health.servers.length > 0) {
+        let html = '<ul>';
+        s.health.servers.forEach(name => {
+          html += '<li>' + name + '</li>';
+        });
+        html += '</ul>';
+        discoveredDiv.innerHTML = html;
+      } else {
+        discoveredDiv.innerHTML = '<p data-i18n="mcp.no_servers">' + getMcpText('no_servers') + '</p>';
+      }
+
+      // 重新应用国际化
+      _applyI18n();
+    }
+  } catch (e) {
+    console.error('Failed to refresh MCP status:', e);
+  }
+}
+
+async function restartMcpProxy() {
+  if (!confirm(getMcpText('confirm_restart'))) return;
+  try {
+    const resp = await fetch('/api/mcp/restart{{ '?token=' + token if token else '' }}', {method: 'POST'});
+    const data = await resp.json();
+    alert(data.message || (data.ok ? getMcpText('restart_success') : getMcpText('restart_failed')));
+    refreshMcpStatus();
+  } catch (e) {
+    alert(getMcpText('restart_failed') + ': ' + e);
+  }
+}
+
+async function syncMcpConfig() {
+  try {
+    const resp = await fetch('/api/mcp/sync{{ '?token=' + token if token else '' }}', {method: 'POST'});
+    const data = await resp.json();
+    alert(data.message || (data.ok ? getMcpText('sync_success') : getMcpText('sync_failed')));
+    if (data.ok) {
+      setTimeout(refreshMcpStatus, 1000);
+    }
+  } catch (e) {
+    alert(getMcpText('sync_failed') + ': ' + e);
+  }
+}
+
+document.getElementById('btn-mcp-refresh').addEventListener('click', refreshMcpStatus);
+document.getElementById('btn-mcp-restart').addEventListener('click', restartMcpProxy);
+document.getElementById('btn-mcp-sync').addEventListener('click', syncMcpConfig);
+
+// 监听语言切换事件，切换时刷新 MCP 状态
+document.getElementById('console-lang-switch')?.addEventListener('change', () => {
+  setTimeout(refreshMcpStatus, 100);
+});
+
+// 页面加载时刷新状态
+refreshMcpStatus();
+</script>
+
+{% if token %}
+<script>const token = '{{ token }}';</script>
+{% else %}
+<script>const token = '';</script>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iflow-bot-gateway"
+version = "0.4.6.1"
+description = "Multi-channel AI Assistant gateway for iflow CLI — forked from iflow-bot with compression fixes and cross-channel session unification"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "李不是狼", email = "plhys@users.noreply.github.com"},
+]
+keywords = ["ai", "assistant", "chatbot", "iflow", "gateway", "feishu", "qq"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "aiohttp>=3.9.0",
+    "croniter>=6.0.0",
+    "dingtalk-stream>=0.24.0",
+    "discord-py>=2.3.0",
+    "fastapi>=0.111.0",
+    "jinja2>=3.1.0",
+    "lark-oapi>=1.0.0",
+    "loguru>=0.7.0",
+    "prompt-toolkit>=3.0.0",
+    "pydantic-settings>=2.0.0",
+    "pydantic>=2.0.0",
+    "python-multipart>=0.0.9",
+    "python-socks[asyncio]>=2.4.3",
+    "python-telegram-bot>=20.0",
+    "qq-botpy>=1.2.1",
+    "rich>=13.0.0",
+    "slack-sdk>=3.21.0",
+    "typer>=0.9.0",
+    "uvicorn>=0.30.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+iflow-bot = "iflow_bot.cli.commands:app"
+
+[project.urls]
+Homepage = "https://github.com/plhys/iflow-bot-gateway"
+Repository = "https://github.com/plhys/iflow-bot-gateway"
+"Original Project" = "https://github.com/iflowai/iflow-bot"
+
+[tool.setuptools.packages.find]
+include = ["iflow_bot*"]
