@@ -29,7 +29,7 @@
 
 ## 这是什么？
 
-**iflow-bot-gateway** 是一个多渠道 AI 助手网关，基于 [iflow CLI](https://cli.iflow.cn/) 构建。它把 iflow CLI 强大的 AI Agent 能力接入到各种聊天平台，让你可以在飞书、QQ、Telegram、Discord、Slack、钉钉、WhatsApp、邮件等渠道上直接和 AI 助手对话。
+**iflow-bot-gateway** 是一个多渠道消息网关，基于 [iflow CLI](https://cli.iflow.cn/) 构建。它把 iflow CLI 的能力接入到各种聊天平台，让你可以在飞书、QQ、Telegram、Discord、Slack、钉钉、WhatsApp、邮件等渠道上直接和 iflow 对话。
 
 **架构简述**：
 
