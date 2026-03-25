@@ -11,7 +11,7 @@ license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
     {name = "李不是狼", email = "plhys@users.noreply.github.com"},
-    {name = "119 (妖妖酒)"},
+    {name = "妖妖酒 (119)"},
 ]
 keywords = ["ai", "assistant", "chatbot", "iflow", "gateway", "feishu", "qq"]
 classifiers = [
