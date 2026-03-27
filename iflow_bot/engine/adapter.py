@@ -482,6 +482,7 @@ class IFlowAdapter:
         model: Optional[str] = None,
         timeout: Optional[int] = None,
         on_chunk: Optional[Callable] = None,
+        on_thought: Optional[Callable] = None,
         on_tool_call: Optional[Callable] = None,
         on_event: Optional[Callable] = None,
     ) -> str:
@@ -497,6 +498,7 @@ class IFlowAdapter:
             model: 模型名称
             timeout: 超时时间
             on_chunk: 消息块回调，接收 (channel, chat_id, chunk_text)
+            on_thought: 思考块回调，接收 (channel, chat_id, thought_text)
         
         Returns:
             最终响应文本
@@ -515,7 +517,9 @@ class IFlowAdapter:
             
             async def handle_chunk(chunk: AgentMessageChunk):
                 nonlocal chunk_count
-                if not chunk.is_thought and chunk.text and on_chunk:
+                if chunk.is_thought and chunk.text and on_thought:
+                    await on_thought(channel, chat_id, chunk.text)
+                elif not chunk.is_thought and chunk.text and on_chunk:
                     chunk_count += 1
                     logger.debug(f"Stream chunk #{chunk_count}: {len(chunk.text)} chars")
                     await on_chunk(channel, chat_id, chunk.text)

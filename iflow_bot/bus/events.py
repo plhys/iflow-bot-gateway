@@ -38,6 +38,25 @@ class InboundMessage:
 
 
 @dataclass
+class ExecutionInfo:
+    """Execution metadata for rich display in channels (e.g. Feishu card headers)."""
+    model_name: Optional[str] = None
+    """Model name (e.g. 'claude-opus-4-6')"""
+    content_left_percent: Optional[int] = None
+    """Estimated remaining context window percentage (0-100)"""
+    thinking_time_ms: Optional[int] = None
+    """Time spent in thinking/reasoning phase (milliseconds)"""
+    response_time_ms: Optional[int] = None
+    """Time spent generating the response (milliseconds)"""
+    is_thinking: bool = False
+    """Whether currently in thinking phase"""
+    is_generating: bool = False
+    """Whether currently generating response"""
+    reasoning: str = ""
+    """Accumulated reasoning/thinking content"""
+
+
+@dataclass
 class OutboundMessage:
     """
     Outbound message - from Agent to channel.
@@ -67,6 +86,9 @@ class OutboundMessage:
     
     reply_to_id: Optional[str] = None
     """ID of the message to reply to (if any)"""
+    
+    execution_info: Optional[ExecutionInfo] = None
+    """Execution metadata for rich display (model name, timing, context %)"""
     
     def with_progress(self, content: str, tool_hint: bool = False) -> "OutboundMessage":
         """Create a progress update message."""

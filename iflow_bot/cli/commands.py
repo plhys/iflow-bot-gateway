@@ -447,17 +447,32 @@ def init_workspace(workspace: Path) -> None:
     # 从模板目录复制文件（仅首次初始化）
     templates_dir = get_templates_dir()
 
+    # 检查是否有旧会话（Pod 重建等场景：workspace 文件丢了但会话映射还在）
+    session_map_file = Path.home() / ".iflow-bot" / "session_mappings.json"
+    has_existing_sessions = False
+    if session_map_file.exists():
+        try:
+            data = json.loads(session_map_file.read_text(encoding="utf-8"))
+            has_existing_sessions = bool(data)
+        except (json.JSONDecodeError, OSError):
+            pass
+
     # 需要复制的模板文件
     template_files = [
         "AGENTS.md",
         "BOOT.md",
-        "BOOTSTRAP.md",
         "HEARTBEAT.md",
         "IDENTITY.md",
         "SOUL.md",
         "TOOLS.md",
         "USER.md",
     ]
+
+    # 只有真正的全新安装才复制 BOOTSTRAP.md（有旧会话说明不是第一次用）
+    if not has_existing_sessions:
+        template_files.append("BOOTSTRAP.md")
+    else:
+        console.print(f"[dim]Existing sessions found, skipping BOOTSTRAP.md[/dim]")
 
     for filename in template_files:
         src = templates_dir / filename

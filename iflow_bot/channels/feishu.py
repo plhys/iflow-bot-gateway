@@ -9,13 +9,17 @@ import contextlib
 import json
 import logging
 import os
+import random
 import re
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
 from iflow_bot.bus.events import OutboundMessage
+from iflow_bot.bus.events import ExecutionInfo
+from iflow_bot.bus.events import InboundMessage
 from iflow_bot.bus.queue import MessageBus
 from iflow_bot.channels.base import BaseChannel
 from iflow_bot.channels.manager import register_channel
@@ -39,6 +43,7 @@ try:
         PatchMessageRequestBody,
         P2ImChatAccessEventBotP2pChatEnteredV1,
         P2ImMessageMessageReadV1,
+        P2ImMessageRecalledV1,
         P2ImMessageReceiveV1,
         P2ImMessageReactionCreatedV1,
         P2ImMessageReactionDeletedV1,
@@ -319,6 +324,7 @@ class FeishuChannel(BaseChannel):
     """
 
     name = "feishu"
+    _API_TIMEOUT = 30.0  # seconds
 
     def __init__(self, config: FeishuConfig, bus: MessageBus):
         """Initialize Feishu Channel.
@@ -337,7 +343,9 @@ class FeishuChannel(BaseChannel):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._streaming_message_ids: dict[str, str] = {}
         self._streaming_last_content: dict[str, str] = {}
+        self._streaming_start_time: dict[str, float] = {}  # wall-clock: 消息创建时间
         self._typing_reaction_ids: dict[str, str] = {}
+        self._typing_reaction_timestamps: dict[str, float] = {}
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -375,6 +383,8 @@ class FeishuChannel(BaseChannel):
             self._on_reaction_created_sync
         ).register_p2_im_message_reaction_deleted_v1(
             self._on_reaction_deleted_sync
+        ).register_p2_im_message_recalled_v1(
+            self._on_message_recalled_sync
         ).register_p2_im_message_message_read_v1(
             self._on_message_read_sync
         ).register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
@@ -391,8 +401,8 @@ class FeishuChannel(BaseChannel):
 
         # Start WebSocket client in a separate thread with reconnect loop
         def run_ws() -> None:
-            import time
-            import asyncio
+            reconnect_delay = 5
+            max_reconnect_delay = 300  # 5 minutes cap
             while self._running:
                 new_loop: Optional[asyncio.AbstractEventLoop] = None
                 try:
@@ -405,6 +415,9 @@ class FeishuChannel(BaseChannel):
                     self._ws_loop = new_loop
                     asyncio.set_event_loop(new_loop)
                     ws_client_module.loop = new_loop
+
+                    # Reset delay before blocking start() — if we got here, connection setup succeeded
+                    reconnect_delay = 5
 
                     # 现在可以安全地调用 start()
                     self._ws_client.start()
@@ -432,7 +445,9 @@ class FeishuChannel(BaseChannel):
                         if self._ws_loop is new_loop:
                             self._ws_loop = None
                 if self._running:
-                    time.sleep(5)
+                    jitter = random.uniform(0, reconnect_delay * 0.3)
+                    time.sleep(reconnect_delay + jitter)
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
@@ -440,14 +455,35 @@ class FeishuChannel(BaseChannel):
         logger.info("Feishu bot started with WebSocket long connection")
         logger.info("No public IP required - using WebSocket to receive events")
 
-        # Keep running until stopped
+        # Keep running until stopped; periodically clean up stale state
+        cleanup_counter = 0
         while self._running:
             await asyncio.sleep(1)
+            cleanup_counter += 1
+            if cleanup_counter >= 60:  # 每 60 秒清理一次
+                cleanup_counter = 0
+                try:
+                    await self._cleanup_stale_reactions()
+                    # 清理超过 5 分钟未更新的流式残留状态
+                    now = time.time()
+                    stale_streams = [
+                        k for k, v in self._streaming_last_content.items()
+                        if k in self._streaming_message_ids
+                    ]
+                    for k in stale_streams:
+                        self._streaming_message_ids.pop(k, None)
+                        self._streaming_last_content.pop(k, None)
+                        self._streaming_start_time.pop(k, None)
+                    if stale_streams:
+                        logger.info(f"Cleaned {len(stale_streams)} stale streaming entries")
+                except Exception as e:
+                    logger.debug(f"Periodic cleanup error: {e}")
 
     async def stop(self) -> None:
         """Stop the Feishu bot."""
         self._running = False
-        if self._ws_loop and self._ws_client:
+        ws_loop = self._ws_loop  # snapshot to avoid race with WS thread
+        if ws_loop and self._ws_client:
             def _shutdown_ws() -> None:
                 async def _close() -> None:
                     with contextlib.suppress(Exception):
@@ -461,7 +497,7 @@ class FeishuChannel(BaseChannel):
                 asyncio.create_task(_close())
 
             with contextlib.suppress(Exception):
-                self._ws_loop.call_soon_threadsafe(_shutdown_ws)
+                ws_loop.call_soon_threadsafe(_shutdown_ws)
         if self._ws_thread and self._ws_thread.is_alive():
             await asyncio.to_thread(self._ws_thread.join, 5)
         self._ws_thread = None
@@ -557,6 +593,133 @@ class FeishuChannel(BaseChannel):
                     el["content"] = el["content"].replace(f"\x00CODE{i}\x00", cb)
 
         return elements or [{"tag": "markdown", "content": content}]
+
+    @staticmethod
+    def _format_time(ms: int) -> str:
+        """Format milliseconds to human-readable time string."""
+        if ms < 1000:
+            return f"{ms}ms"
+        if ms < 1000:
+            return f"{ms}ms"
+        total_seconds = ms / 1000
+        if total_seconds < 60:
+            return f"{total_seconds:.1f}s"
+        minutes = int(total_seconds) // 60
+        seconds = total_seconds - minutes * 60
+        hours = minutes // 60
+        if hours > 0:
+            minutes = minutes % 60
+            return f"{hours}h{minutes}m"
+        return f"{minutes}m{seconds:.0f}s"
+
+    def _build_rich_card(self, content: str, exec_info: ExecutionInfo | None = None, wall_clock_ms: int | None = None) -> dict:
+        """Build a rich interactive card with status header.
+
+        When exec_info is provided, the card includes:
+        - Model name (blue), context remaining % (grey)
+        - Thinking status with timing
+        - Response status with timing (orange=generating, green=done)
+        - Reasoning section separated by hr from response content
+
+        Args:
+            content: Response text content
+            exec_info: Optional execution metadata
+            wall_clock_ms: Wall-clock elapsed time since message creation (overrides backend timing)
+
+        Returns:
+            Feishu interactive card dict
+        """
+        if not exec_info:
+            return {
+                "config": {"wide_screen_mode": True},
+                "elements": self._build_card_elements(content),
+            }
+
+        elements: list[dict] = []
+
+        # 用 wall-clock 时间覆盖后端传来的时间（后端时间会因工具调用等卡住）
+        display_time_ms = wall_clock_ms if wall_clock_ms is not None else (exec_info.response_time_ms or exec_info.thinking_time_ms)
+
+        # --- Thinking section ---
+        # 思考阶段：只要 is_thinking=True 就显示 header（不要求 reasoning 有内容）
+        has_reasoning = exec_info.reasoning and exec_info.reasoning.strip()
+        if exec_info.is_thinking or has_reasoning:
+            # Thinking header line
+            parts: list[str] = []
+            if exec_info.model_name:
+                parts.append(f"<font color='blue'>{exec_info.model_name}</font>")
+            percent = exec_info.content_left_percent if exec_info.content_left_percent is not None else 100
+            parts.append(f"<font color='grey'>剩余 {percent}%</font>")
+
+            if exec_info.is_thinking:
+                time_str = f" ({self._format_time(display_time_ms)})" if display_time_ms else ""
+                parts.append(f"💭 不要急，容我想想{time_str}")
+            elif exec_info.thinking_time_ms is not None:
+                parts.append(f"💭 想好了 ({self._format_time(exec_info.thinking_time_ms)})")
+
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "content": "  <font color='grey'>|</font>  ".join(parts),
+                    "tag": "lark_md",
+                },
+            })
+
+            # Reasoning content (simplified markdown for stability)
+            if has_reasoning:
+                elements.append({"tag": "markdown", "content": exec_info.reasoning.strip()})
+                elements.append({"tag": "hr"})
+
+        # --- Response section ---
+        response_parts: list[str] = []
+        if exec_info.model_name:
+            response_parts.append(f"<font color='blue'>{exec_info.model_name}</font>")
+        percent = exec_info.content_left_percent if exec_info.content_left_percent is not None else 100
+        response_parts.append(f"<font color='grey'>剩余 {percent}%</font>")
+
+        if exec_info.is_generating:
+            time_str = f" ({self._format_time(display_time_ms)})" if display_time_ms else ""
+            response_parts.append(f"<font color='orange'>📝 回复中{time_str}</font>")
+        elif not exec_info.is_thinking:
+            # 已完成（不在思考也不在回复）
+            done_time = display_time_ms or exec_info.response_time_ms
+            time_str = f" ({self._format_time(done_time)})" if done_time else ""
+            response_parts.append(f"<font color='green'>✅ 已完成{time_str}</font>")
+
+        if response_parts:
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "content": "  <font color='grey'>|</font>  ".join(response_parts),
+                    "tag": "lark_md",
+                },
+            })
+
+        # Response content
+        if content and content.strip():
+            elements.extend(self._build_card_elements(content))
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "elements": elements or [{"tag": "markdown", "content": content or "(空响应)"}],
+        }
+
+    @staticmethod
+    def _build_error_card(error_message: str) -> dict:
+        """Build an error display card."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "content": "<font color='red'>⚠️ 处理失败</font>",
+                        "tag": "lark_md",
+                    },
+                },
+                {"tag": "markdown", "content": str(error_message)},
+            ],
+        }
 
     # File type mappings
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
@@ -813,6 +976,7 @@ class FeishuChannel(BaseChannel):
                 await self._remove_typing_reaction(source_message_id)
             self._streaming_message_ids.pop(stream_key, None)
             self._streaming_last_content.pop(stream_key, None)
+            self._streaming_start_time.pop(stream_key, None)
             logger.debug(f"Feishu streaming ended: {stream_key}")
             return
 
@@ -822,7 +986,9 @@ class FeishuChannel(BaseChannel):
             return
 
         content_len = len(content)
-        if self._streaming_last_content.get(stream_key) == content:
+        # 内容相同时通常跳过，但如果是最终消息（is_generating=False）则仍需 patch 以更新 header 状态
+        is_final = msg.execution_info and not msg.execution_info.is_generating
+        if self._streaming_last_content.get(stream_key) == content and not is_final:
             logger.debug(f"Feishu streaming skip duplicate content: {stream_key} len={content_len}")
             return
 
@@ -830,11 +996,14 @@ class FeishuChannel(BaseChannel):
         if source_message_id:
             await self._remove_typing_reaction(source_message_id)
 
-        # 流式阶段尽量简化内容，减少复杂卡片元素导致的不稳定性
-        card_content = json.dumps({
-            "config": {"wide_screen_mode": True},
-            "elements": [{"tag": "markdown", "content": content}],
-        }, ensure_ascii=False)
+        # wall-clock 计时：记录首次消息时间，每次 patch 用当前时间减去起点
+        if stream_key not in self._streaming_start_time:
+            self._streaming_start_time[stream_key] = time.time()
+        wall_clock_ms = int((time.time() - self._streaming_start_time[stream_key]) * 1000)
+
+        # 流式阶段使用 rich card 显示状态 header（模型名、思考/回复耗时等）
+        card = self._build_rich_card(content, msg.execution_info, wall_clock_ms=wall_clock_ms)
+        card_content = json.dumps(card, ensure_ascii=False)
 
         message_id = self._streaming_message_ids.get(stream_key)
         if message_id:
@@ -844,8 +1013,9 @@ class FeishuChannel(BaseChannel):
                 message_id,
                 content_len,
             )
-            patched = await loop.run_in_executor(
-                None, self._patch_message_sync, message_id, card_content
+            patched = await asyncio.wait_for(
+                loop.run_in_executor(None, self._patch_message_sync, message_id, card_content),
+                timeout=self._API_TIMEOUT,
             )
             if patched:
                 self._streaming_last_content[stream_key] = content
@@ -870,9 +1040,12 @@ class FeishuChannel(BaseChannel):
             msg.chat_id,
             content_len,
         )
-        created_id = await loop.run_in_executor(
-            None, self._send_message_sync,
-            receive_id_type, msg.chat_id, "interactive", card_content
+        created_id = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, self._send_message_sync,
+                receive_id_type, msg.chat_id, "interactive", card_content
+            ),
+            timeout=self._API_TIMEOUT,
         )
         if created_id:
             self._streaming_message_ids[stream_key] = created_id
@@ -955,6 +1128,7 @@ class FeishuChannel(BaseChannel):
     async def _remove_typing_reaction(self, source_message_id: str) -> None:
         """Remove the pending typing reaction from a source message."""
         reaction_id = self._typing_reaction_ids.pop(source_message_id, None)
+        self._typing_reaction_timestamps.pop(source_message_id, None)
         if not reaction_id:
             return
 
@@ -964,6 +1138,17 @@ class FeishuChannel(BaseChannel):
         )
         if deleted:
             logger.debug(f"Typing reaction cleared: {source_message_id}")
+
+    async def _cleanup_stale_reactions(self) -> None:
+        """Remove typing reactions that are older than 5 minutes (likely from crashed processing)."""
+        now = time.time()
+        stale_ids = [
+            msg_id for msg_id, ts in self._typing_reaction_timestamps.items()
+            if now - ts > 300
+        ]
+        for msg_id in stale_ids:
+            await self._remove_typing_reaction(msg_id)
+            self._typing_reaction_timestamps.pop(msg_id, None)
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present.
@@ -999,6 +1184,7 @@ class FeishuChannel(BaseChannel):
 
             self._streaming_message_ids.pop(msg.chat_id, None)
             self._streaming_last_content.pop(msg.chat_id, None)
+            self._streaming_start_time.pop(msg.chat_id, None)
 
             # Handle media files first
             media = getattr(msg, 'media', None) or []
@@ -1008,36 +1194,60 @@ class FeishuChannel(BaseChannel):
                     continue
                 ext = os.path.splitext(file_path)[1].lower()
                 if ext in self._IMAGE_EXTS:
-                    key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
+                    key = await asyncio.wait_for(
+                        loop.run_in_executor(None, self._upload_image_sync, file_path),
+                        timeout=self._API_TIMEOUT,
+                    )
                     if key:
-                        await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, "image",
-                            json.dumps({"image_key": key}, ensure_ascii=False),
+                        await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, "image",
+                                json.dumps({"image_key": key}, ensure_ascii=False),
+                            ),
+                            timeout=self._API_TIMEOUT,
                         )
                 else:
-                    key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+                    key = await asyncio.wait_for(
+                        loop.run_in_executor(None, self._upload_file_sync, file_path),
+                        timeout=self._API_TIMEOUT,
+                    )
                     if key:
                         media_type = "audio" if ext in self._AUDIO_EXTS else "file"
-                        await loop.run_in_executor(
-                            None, self._send_message_sync,
-                            receive_id_type, msg.chat_id, media_type,
-                            json.dumps({"file_key": key}, ensure_ascii=False),
+                        await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None, self._send_message_sync,
+                                receive_id_type, msg.chat_id, media_type,
+                                json.dumps({"file_key": key}, ensure_ascii=False),
+                            ),
+                            timeout=self._API_TIMEOUT,
                         )
 
-            # Send text content as interactive card
+            # Send text content as interactive card (with rich header if ExecutionInfo present)
             if msg.content and msg.content.strip():
-                card = {
-                    "config": {"wide_screen_mode": True},
-                    "elements": self._build_card_elements(msg.content)
-                }
-                await loop.run_in_executor(
-                    None, self._send_message_sync,
-                    receive_id_type, msg.chat_id, "interactive",
-                    json.dumps(card, ensure_ascii=False),
+                if msg.metadata.get("_error"):
+                    card = self._build_error_card(msg.content)
+                else:
+                    final_wall_ms = None
+                    start_t = self._streaming_start_time.get(msg.chat_id)
+                    if start_t:
+                        final_wall_ms = int((time.time() - start_t) * 1000)
+                    card = self._build_rich_card(msg.content, msg.execution_info, wall_clock_ms=final_wall_ms)
+                await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, self._send_message_sync,
+                        receive_id_type, msg.chat_id, "interactive",
+                        json.dumps(card, ensure_ascii=False),
+                    ),
+                    timeout=self._API_TIMEOUT,
                 )
 
         except Exception as e:
+            # 清理可能残留的流式状态，防止内存泄漏
+            if hasattr(msg, 'chat_id') and msg.chat_id:
+                self._streaming_message_ids.pop(msg.chat_id, None)
+                self._streaming_last_content.pop(msg.chat_id, None)
+                self._streaming_start_time.pop(msg.chat_id, None)
             logger.error(f"Error sending Feishu message: {e}")
 
     def _on_reaction_created_sync(self, data: "P2ImMessageReactionCreatedV1") -> None:
@@ -1056,13 +1266,53 @@ class FeishuChannel(BaseChannel):
         """Handle bot access events (no-op, just to suppress SDK noise)."""
         pass
 
+    def _on_message_recalled_sync(self, data: "P2ImMessageRecalledV1") -> None:
+        """Handle message recalled event — forward to bus so loop can cancel processing."""
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._on_message_recalled(data), self._loop)
+
+    async def _on_message_recalled(self, data: "P2ImMessageRecalledV1") -> None:
+        """Process message recall: publish a special inbound message to cancel active task."""
+        try:
+            event = data.event
+            message_id = event.message_id
+            chat_id = event.chat_id
+            logger.info(f"Feishu message recalled: message_id={message_id} chat_id={chat_id}")
+
+            # Determine reply_to (same logic as _on_message — use chat_id for group, sender for private)
+            # For recall events we don't have chat_type, so we check if chat_id looks like a group
+            # Actually chat_id from recall event is the chat_id, which is the conversation ID
+            # We need to figure out the reply_to used for this message
+            # Since we use unified session, just publish with chat_id
+            await self.bus.publish_inbound(
+                InboundMessage(
+                    channel="feishu",
+                    sender_id="system",
+                    chat_id=chat_id or "",
+                    content="",
+                    metadata={
+                        "_recalled": True,
+                        "recalled_message_id": message_id,
+                    },
+                )
+            )
+        except Exception as e:
+            logger.error(f"Error processing Feishu recall event: {e}")
+
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """Sync handler for incoming messages (called from WebSocket thread).
 
         Schedules async handling in the main event loop.
         """
         if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+            future = asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+            future.add_done_callback(self._on_message_future_done)
+
+    @staticmethod
+    def _on_message_future_done(future) -> None:
+        exc = future.exception()
+        if exc:
+            logger.error(f"Unhandled error in _on_message: {exc}")
 
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
         """Handle incoming message from Feishu.
@@ -1070,6 +1320,8 @@ class FeishuChannel(BaseChannel):
         Processes message content, downloads media if present,
         and publishes to message bus.
         """
+        await self._cleanup_stale_reactions()
+
         try:
             event = data.event
             message = event.message
@@ -1094,10 +1346,16 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
+            # Skip system messages (e.g. "你撤回了一条消息重新编辑")
+            if msg_type == "system":
+                logger.debug(f"Skipping system message: message_id={message_id}")
+                return
+
             # 秒回"敲键盘"反应，作为处理中提示
             typing_reaction_id = await self._add_reaction(message_id, "OnIt")
             if typing_reaction_id:
                 self._typing_reaction_ids[message_id] = typing_reaction_id
+                self._typing_reaction_timestamps[message_id] = time.time()
 
             # Parse content
             content_parts: list[str] = []
@@ -1117,23 +1375,29 @@ class FeishuChannel(BaseChannel):
                 text_parts, resources = _extract_post_parts(content_json)
                 if text_parts:
                     content_parts.extend(text_parts)
-                for resource in resources:
-                    resource_type = resource.get("type")
-                    if resource_type == "image":
-                        file_path, content_text = await self._download_and_save_media(
-                            "image", resource, message_id
-                        )
-                    elif resource_type in ("file", "media", "audio"):
-                        file_path, content_text = await self._download_and_save_media(
-                            resource_type, resource, message_id
-                        )
-                    else:
-                        file_path, content_text = None, f"[{resource_type}]"
+                if resources:
+                    async def _download_resource(resource):
+                        resource_type = resource.get("type")
+                        if resource_type == "image":
+                            return await self._download_and_save_media("image", resource, message_id)
+                        elif resource_type in ("file", "media", "audio"):
+                            return await self._download_and_save_media(resource_type, resource, message_id)
+                        else:
+                            return None, f"[{resource_type}]"
 
-                    if file_path:
-                        media_paths.append(file_path)
-                    if content_text:
-                        content_parts.append(content_text)
+                    results = await asyncio.gather(
+                        *[_download_resource(r) for r in resources],
+                        return_exceptions=True,
+                    )
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logger.warning(f"Media download failed: {result}")
+                            continue
+                        file_path, content_text = result
+                        if file_path:
+                            media_paths.append(file_path)
+                        if content_text:
+                            content_parts.append(content_text)
 
             elif msg_type in ("image", "audio", "file", "media"):
                 file_path, content_text = await self._download_and_save_media(

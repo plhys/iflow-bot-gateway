@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Optional
 from loguru import logger
 
 from iflow_bot.bus import MessageBus, InboundMessage, OutboundMessage
+from iflow_bot.bus.events import ExecutionInfo
 from iflow_bot.engine.adapter import IFlowAdapter
 from iflow_bot.engine.analyzer import result_analyzer, AnalysisResult
 from iflow_bot.engine.commands import CommandContext, build_command_registry
@@ -48,6 +49,119 @@ if TYPE_CHECKING:
 
 # 支持流式输出的渠道列表
 STREAMING_CHANNELS = {"telegram", "discord", "slack", "dingtalk", "qq", "feishu"}
+
+# 搜索关键词 - 检测到时自动加搜索提示前缀
+SEARCH_KEYWORDS = [
+    "搜索", "查找", "查询", "最新", "新闻", "天气",
+    "股价", "汇率", "今天", "明天", "本周", "本月",
+    "今年", "2024", "2025", "2026", "2027", "2028",
+]
+
+# 模型上下文容量映射（用于计算 content_left_percent）
+_MODEL_CONTEXT_LIMITS: dict[str, int] = {
+    "glm-4": 128000, "glm-5": 128000,
+    "gpt-4": 128000, "gpt-4o": 128000, "gpt-4o-mini": 128000,
+    "o1": 200000, "o1-mini": 128000,
+    "claude-3-opus": 200000, "claude-3-sonnet": 200000, "claude-3-haiku": 200000,
+    "claude-3.5-sonnet": 200000, "claude-3.5-haiku": 200000,
+    "claude-opus-4": 200000, "claude-sonnet-4": 200000,
+    "qwen-turbo": 131072, "qwen-plus": 131072, "qwen-max": 32768,
+    "deepseek-chat": 64000, "deepseek-reasoner": 64000,
+    "kimi": 131072, "kimi-k2": 131072, "kimi-k2.5": 131072,
+    "gemini-1.5-pro": 1048576, "gemini-1.5-flash": 1048576,
+    "minimax-m1": 1000000, "MiniMax-M1": 1000000,
+}
+_DEFAULT_MAX_TOKENS = 128000
+
+
+def _get_model_max_tokens(model_name: str) -> int:
+    """Get max context tokens for a model name (fuzzy match)."""
+    if not model_name:
+        return _DEFAULT_MAX_TOKENS
+    name = model_name.lower()
+    # exact match
+    if name in _MODEL_CONTEXT_LIMITS:
+        return _MODEL_CONTEXT_LIMITS[name]
+    # fuzzy match
+    for key, limit in _MODEL_CONTEXT_LIMITS.items():
+        if name.startswith(key) or key.startswith(name):
+            return limit
+    # series inference
+    if "claude" in name:
+        return 200000
+    if "gpt-4" in name:
+        return 128000
+    if "qwen" in name:
+        return 131072
+    if "deepseek" in name:
+        return 64000
+    if "gemini" in name:
+        return 1048576
+    if "kimi" in name:
+        return 131072
+    return _DEFAULT_MAX_TOKENS
+
+
+_EXEC_INFO_RE = re.compile(r"<Execution Info>([\s\S]*?)</Execution Info>")
+_EXEC_INFO_PARTIAL_RE = re.compile(r"<Execution Info>([\s\S]*?)(?:</Execution Info>|$)")
+
+
+def _parse_execution_info(text: str, model_name: str) -> Optional[int]:
+    """Parse <Execution Info> from CLI output to extract content_left_percent.
+
+    Returns percentage (0-100) or None if not found.
+    """
+    m = _EXEC_INFO_RE.search(text) or _EXEC_INFO_PARTIAL_RE.search(text)
+    if not m:
+        return None
+    try:
+        json_str = m.group(1).strip()
+        # check brace balance for partial matches
+        if json_str.count("{") != json_str.count("}"):
+            return None
+        info = json.loads(json_str)
+        token_usage = info.get("tokenUsage") or info.get("token_usage") or {}
+        input_tokens = token_usage.get("input", 0)
+        if input_tokens > 0:
+            max_tokens = _get_model_max_tokens(model_name)
+            remaining = max(0, max_tokens - input_tokens)
+            return round((remaining / max_tokens) * 100)
+    except (json.JSONDecodeError, TypeError, KeyError):
+        pass
+    return None
+
+
+def _clean_execution_info(text: str) -> str:
+    """Remove <Execution Info> block from response text."""
+    cleaned = _EXEC_INFO_RE.sub("", text).strip()
+    # also remove trailing warnings
+    idx = cleaned.rfind("⚠️")
+    if idx > 0:
+        cleaned = cleaned[:idx].strip()
+    return cleaned
+
+
+def _estimate_content_left_from_session(session_id: str, model_name: str) -> Optional[int]:
+    """Estimate content_left_percent from ACP session file size.
+
+    Fallback for ACP mode where <Execution Info> is not available.
+    Reads the session file and estimates token usage from total JSON char count.
+
+    Returns percentage (0-100) or None if session file not found.
+    """
+    session_file = Path.home() / ".iflow" / "acp" / "sessions" / f"{session_id}.json"
+    if not session_file.exists():
+        return None
+    try:
+        size_bytes = session_file.stat().st_size
+        # ~3.5 chars per token is a rough heuristic for mixed CJK/English content
+        estimated_tokens = int(size_bytes / 3.5)
+        max_tokens = _get_model_max_tokens(model_name)
+        remaining = max(0, max_tokens - estimated_tokens)
+        percent = round((remaining / max_tokens) * 100)
+        return max(0, min(100, percent))
+    except Exception:
+        return None
 
 # 流式输出缓冲区大小范围（字符数）
 STREAM_BUFFER_MIN = 10
@@ -94,9 +208,13 @@ class AgentLoop:
         self._ralph_supervisor_task: Optional[asyncio.Task] = None
         self._command_registry = build_command_registry()
         self._fast_path_command_names = {"/help", "/status", "/language"}
+        self._language_cache: tuple[float, str] = (0.0, "")
         
         # P3: 每用户并发锁，确保同一用户的消息串行处理，避免会话状态混乱
         self._user_locks: dict[str, asyncio.Lock] = {}
+
+        # 跟踪 message_id → task，用于撤回消息时取消正在处理的请求
+        self._active_message_tasks: dict[str, asyncio.Task] = {}
 
         logger.info(f"AgentLoop initialized with model={model}, workspace={self.workspace}, streaming={streaming}")
 
@@ -342,21 +460,27 @@ class AgentLoop:
 
 SOUL.md - Who You Are（你的灵魂）定义了你是谁，你的性格、特点、行为准则等核心信息。
 IDENTITY.md - Your Identity（你的身份）定义了你的具体身份信息，如名字、年龄、职业、兴趣爱好等。
-USERY.md - User Identity（用户身份）定义了用户的具体身份信息，如名字、年龄、职业、兴趣爱好等。
+USER.md - User Identity（用户身份）定义了用户的具体身份信息，如名字、年龄、职业、兴趣爱好等。
 TOOLS.md - Your Tools（你的工具）定义了你可以使用的工具列表，包括每个工具的名称、功能描述、使用方法等, 每次学会一个工具，你便要主动更新该文件。
 
 用户消息: {message}"""
 
     def _load_language_setting(self) -> str:
+        now = time.time()
+        cached_ts, cached_lang = self._language_cache
+        if cached_lang and now - cached_ts < 30.0:
+            return cached_lang
         settings_path = self.workspace / ".iflow" / "settings.json"
         if settings_path.exists():
             try:
                 data = json.loads(settings_path.read_text(encoding="utf-8"))
                 lang = self._normalize_language_setting(data.get("language"))
                 if lang:
+                    self._language_cache = (now, lang)
                     return lang
             except Exception:
                 pass
+        self._language_cache = (now, "zh-CN")
         return "zh-CN"
 
     def _normalize_language_setting(self, lang: object) -> str:
@@ -591,73 +715,6 @@ policy: {policy}
         if message:
             return f"{message}\n\n{prompt}"
         return prompt
-
-    async def _resolve_media_paths(self, media: list[str]) -> list[str]:
-        """Normalize media to local files (download remote URLs into workspace)."""
-        resolved: list[str] = []
-        if not media:
-            return resolved
-
-        workspace = self.workspace or Path.home() / ".iflow-bot" / "workspace"
-        media_dir = workspace / "images"
-        media_dir.mkdir(parents=True, exist_ok=True)
-
-        def _is_url(value: str) -> bool:
-            return value.startswith("http://") or value.startswith("https://")
-
-        async def _download(url: str) -> Optional[str]:
-            import hashlib
-            import mimetypes
-            import aiohttp
-
-            suffix = ""
-            try:
-                suffix = Path(url.split("?")[0]).suffix
-            except Exception:
-                suffix = ""
-
-            name_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
-            file_path = media_dir / f"remote_{name_hash}{suffix or ''}"
-            try:
-                timeout = aiohttp.ClientTimeout(total=30)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            logger.warning("Failed to download media: {} -> HTTP {}", url, resp.status)
-                            return None
-                        content_type = resp.headers.get("Content-Type", "")
-                        if not suffix:
-                            ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
-                            if ext:
-                                file_path = media_dir / f"remote_{name_hash}{ext}"
-                        data = await resp.read()
-                        file_path.write_bytes(data)
-                        return str(file_path)
-            except Exception as e:
-                logger.warning("Failed to download media {}: {}", url, e)
-                return None
-
-        for item in media:
-            if not item:
-                continue
-            if _is_url(item):
-                downloaded = await _download(item)
-                if downloaded:
-                    resolved.append(downloaded)
-                else:
-                    resolved.append(item)
-                continue
-            path = Path(item)
-            if not path.is_absolute():
-                candidate = media_dir / path
-                if candidate.exists():
-                    resolved.append(str(candidate))
-                else:
-                    resolved.append(str(path))
-            else:
-                resolved.append(str(path))
-
-        return resolved
 
     async def _resolve_media_paths(self, media: list[str]) -> list[str]:
         """Normalize media to local files (download remote URLs into workspace)."""
@@ -7272,9 +7329,45 @@ policy: {policy}
                         msg.chat_id,
                         (msg.content or "")[:200],
                     )
+
+                    # 撤回消息处理：取消正在进行的任务
+                    if msg.metadata.get("_recalled"):
+                        recalled_mid = msg.metadata.get("recalled_message_id", "")
+                        task = self._active_message_tasks.pop(recalled_mid, None)
+                        if task and not task.done():
+                            logger.info(f"Message recalled, cancelling task for message_id={recalled_mid}")
+                            task.cancel()
+                            # 同时发送 ACP/Stdio cancel
+                            try:
+                                mode = getattr(self.adapter, "mode", "")
+                                if mode in ("acp", "stdio"):
+                                    if mode == "acp":
+                                        inner = await self.adapter._get_acp_adapter()
+                                    else:
+                                        inner = await self.adapter._get_stdio_adapter()
+                                    key = inner._get_session_key("feishu", "")
+                                    sid = inner._session_map.get(key)
+                                    if sid and inner._client:
+                                        await inner._client.cancel(sid)
+                                        logger.info(f"ACP cancel sent for recalled message (session={sid[:16]}...)")
+                            except Exception as e:
+                                logger.warning(f"Failed to send ACP cancel on recall: {e}")
+                        else:
+                            logger.debug(f"Recalled message_id={recalled_mid} not found in active tasks (already done)")
+                        continue
+
                     # 异步处理消息
                     task = asyncio.create_task(self._process_message(msg))
                     task.add_done_callback(self._on_process_message_done)
+
+                    # 记录 message_id → task 映射
+                    mid = msg.metadata.get("message_id")
+                    if mid:
+                        self._active_message_tasks[mid] = task
+                        # 清理已完成的旧映射
+                        stale = [k for k, t in self._active_message_tasks.items() if t.done()]
+                        for k in stale:
+                            self._active_message_tasks.pop(k, None)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -7571,6 +7664,10 @@ policy: {policy}
 
                 # 准备消息内容
                 message_content = msg.content
+
+                # 搜索关键词检测：自动加搜索提示前缀
+                if any(kw in message_content for kw in SEARCH_KEYWORDS):
+                    message_content = "请使用网络搜索功能回答以下问题：\n" + message_content
                 
                 # 注入渠道上下文
                 channel_context = self._build_channel_context(msg)
@@ -7618,12 +7715,18 @@ policy: {policy}
                     await self.bus.publish_outbound(outbound)
                     logger.info(f"Response sent to {msg.channel}:{msg.chat_id}")
 
+        except asyncio.CancelledError:
+            logger.info(f"Message processing cancelled (recalled) for {msg.channel}:{msg.chat_id}")
+            # 清理由 _process_with_streaming 的 CancelledError 处理完成
+            # 这里不发新消息，避免创建新卡片导致后续回复错位
+            raise
         except Exception as e:
             logger.exception(f"Error processing message for {msg.channel}:{msg.chat_id}")  # B6
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
                 content=self._msg("process_error", error=e),
+                metadata={"_error": True},
             ))
 
     async def _process_with_streaming(
@@ -7635,6 +7738,7 @@ policy: {policy}
         流式处理消息并发送实时更新到渠道。
         
         使用内容缓冲机制，每满 N 个字符推送一次（随机范围）。
+        支持思考/回复阶段分离、耗时追踪、ExecutionInfo 传递。
         
         Args:
             msg: 入站消息
@@ -7654,6 +7758,16 @@ policy: {policy}
         last_stream_published_content = ""
         first_chunk_seen = False
         placeholder_task: asyncio.Task | None = None
+
+        # 思考/回复阶段追踪
+        thought_buffer = ""
+        is_thinking = False
+        thinking_start_time: float | None = None
+        thinking_end_time: float | None = None
+        response_start_time: float | None = None
+        stream_start_time = time.time()
+        content_left_percent: int | None = None
+        model_name = self.model or ""
         
         # 钉钉使用直接调用方式（AI Card）
         dingtalk_channel = None
@@ -7673,13 +7787,85 @@ policy: {policy}
         if msg.channel == "qq" and self.channel_manager:
             qq_channel = self.channel_manager.get_channel("qq")
 
+        def _build_stream_exec_info() -> ExecutionInfo:
+            """Build current ExecutionInfo snapshot for streaming updates."""
+            now = time.time()
+            t_ms = None
+            if thinking_start_time:
+                end = thinking_end_time or now
+                t_ms = int((end - thinking_start_time) * 1000)
+            r_ms = None
+            if response_start_time:
+                r_ms = int((now - response_start_time) * 1000)
+            return ExecutionInfo(
+                model_name=model_name,
+                content_left_percent=content_left_percent,
+                thinking_time_ms=t_ms,
+                response_time_ms=r_ms,
+                is_thinking=is_thinking,
+                is_generating=True,
+                reasoning=thought_buffer,
+            )
+
+        thought_last_publish_time: float = 0.0
+        THOUGHT_PUBLISH_INTERVAL = 3.0  # 思考状态推送间隔（秒）
+
+        async def on_thought(channel: str, chat_id: str, thought_text: str):
+            """处理思考/推理块。"""
+            nonlocal thought_buffer, is_thinking, thinking_start_time, thought_last_publish_time
+            if not is_thinking:
+                is_thinking = True
+                thinking_start_time = time.time()
+            thought_buffer += thought_text
+
+            # 定期推送思考状态到飞书，让用户看到"思考中"+ 实时计时
+            now = time.time()
+            if channel not in ("qq", "dingtalk") and now - thought_last_publish_time >= THOUGHT_PUBLISH_INTERVAL:
+                thought_last_publish_time = now
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content="...",
+                    metadata={
+                        "_progress": True,
+                        "_streaming": True,
+                        **self._build_reply_metadata(msg),
+                    },
+                    execution_info=_build_stream_exec_info(),
+                ))
+
         async def on_chunk(channel: str, chat_id: str, chunk_text: str):
             """处理流式消息块。"""
             nonlocal unflushed_count, current_threshold, qq_segment_buffer, qq_line_buffer
             nonlocal qq_newline_count, qq_in_code_block, last_stream_published_content, first_chunk_seen
+            nonlocal is_thinking, thinking_end_time, response_start_time
+            nonlocal content_left_percent
 
             key = f"{channel}:{chat_id}"
             first_chunk_seen = True
+
+            # 首次 chunk 到来时，从 ACP session 文件估算 content_left_percent
+            if content_left_percent is None:
+                try:
+                    mapping_file = Path.home() / ".iflow-bot" / "session_mappings.json"
+                    if mapping_file.exists():
+                        with open(mapping_file, "r", encoding="utf-8") as mf:
+                            mappings = json.load(mf)
+                        sid = mappings.get("unified:default")
+                        if sid:
+                            estimated = _estimate_content_left_from_session(sid, model_name)
+                            if estimated is not None:
+                                content_left_percent = estimated
+                except Exception:
+                    pass
+
+            # 从思考阶段切换到回复阶段
+            if is_thinking:
+                is_thinking = False
+                thinking_end_time = time.time()
+                response_start_time = time.time()
+            elif response_start_time is None:
+                response_start_time = time.time()
 
             # 更新累积缓冲区（所有渠道，用于记录完整内容与日志）
             self._stream_buffers[key] = self._stream_buffers.get(key, "") + chunk_text
@@ -7749,7 +7935,8 @@ policy: {policy}
                             "_streaming": True,
                             **self._build_reply_metadata(msg),
                         },
-                ))
+                        execution_info=_build_stream_exec_info(),
+                    ))
                     last_stream_published_content = content
 
         async def emit_waiting_placeholder():
@@ -7779,6 +7966,7 @@ policy: {policy}
                 chat_id=msg.chat_id,
                 model=self.model,
                 on_chunk=on_chunk,
+                on_thought=on_thought,
             )
             if placeholder_task:
                 placeholder_task.cancel()
@@ -7845,6 +8033,43 @@ policy: {policy}
                     )
 
             if effective_content:
+                # 解析 Execution Info 提取 token 用量
+                parsed_percent = _parse_execution_info(effective_content, model_name)
+                if parsed_percent is not None:
+                    content_left_percent = parsed_percent
+                    logger.info(f"Parsed content_left_percent={content_left_percent}% from Execution Info")
+                else:
+                    # ACP 模式下没有 Execution Info，从 session 文件估算
+                    try:
+                        mapping_file = Path.home() / ".iflow-bot" / "session_mappings.json"
+                        if mapping_file.exists():
+                            with open(mapping_file, "r", encoding="utf-8") as mf:
+                                mappings = json.load(mf)
+                            # ACP unified session key
+                            sid = mappings.get("unified:default")
+                            if sid:
+                                estimated = _estimate_content_left_from_session(sid, model_name)
+                                if estimated is not None:
+                                    content_left_percent = estimated
+                                    logger.info(f"Estimated content_left_percent={content_left_percent}% from session file")
+                    except Exception as e:
+                        logger.debug(f"Failed to estimate content_left_percent: {e}")
+
+                # 清理 Execution Info 标签
+                effective_content = _clean_execution_info(effective_content)
+
+                # 构建最终 ExecutionInfo
+                now = time.time()
+                final_exec_info = ExecutionInfo(
+                    model_name=model_name,
+                    content_left_percent=content_left_percent,
+                    thinking_time_ms=int((thinking_end_time - thinking_start_time) * 1000) if thinking_start_time and thinking_end_time else None,
+                    response_time_ms=int((now - response_start_time) * 1000) if response_start_time else int((now - stream_start_time) * 1000),
+                    is_thinking=False,
+                    is_generating=False,
+                    reasoning=thought_buffer,
+                )
+
                 # 🆕 流式结束后，也用 ResultAnalyzer 分析并附加检测到的文件
                 analysis = result_analyzer.analyze({"output": effective_content, "success": True})
                 media_files = analysis.image_files + analysis.audio_files + analysis.video_files + analysis.doc_files
@@ -7865,7 +8090,8 @@ policy: {policy}
                         ))
                 elif msg.channel != "qq":
                     # 其他渠道（非 QQ、非钉钉）：通过消息总线
-                    should_emit_final_content = bool(media_files) or effective_content != last_stream_published_content
+                    # 即使内容相同，final_exec_info 也需要发送以更新卡片 header 状态（Doing → Done）
+                    should_emit_final_content = bool(media_files) or effective_content != last_stream_published_content or final_exec_info is not None
                     if should_emit_final_content:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel,
@@ -7877,6 +8103,7 @@ policy: {policy}
                                 "_streaming": True,
                                 **self._build_reply_metadata(msg),
                             },
+                            execution_info=final_exec_info,
                         ))
                     # 再发送流式结束标记
                     await self.bus.publish_outbound(OutboundMessage(
@@ -7917,7 +8144,36 @@ policy: {policy}
                 logger.warning(f"Streaming produced empty output for {msg.channel}:{msg.chat_id}")
             
             return effective_content or response
-            
+
+        except asyncio.CancelledError:
+            # 用户撤回消息导致 task 被 cancel
+            if placeholder_task:
+                placeholder_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await placeholder_task
+            self._stream_buffers.pop(session_key, None)
+            # 先 patch "已撤回" 到已有的 placeholder 卡片上（_streaming=True 会触发 patch）
+            with contextlib.suppress(Exception):
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="⌫ 已撤回，处理已取消",
+                    metadata={
+                        "_progress": True,
+                        "_streaming": True,
+                        **self._build_reply_metadata(msg),
+                    },
+                ))
+            # 再发 _streaming_end 清理流式状态（清掉 _streaming_message_ids）
+            with contextlib.suppress(Exception):
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="",
+                    metadata={"_streaming_end": True, **self._build_reply_metadata(msg)},
+                ))
+            raise
+
         except Exception as e:
             if placeholder_task:
                 placeholder_task.cancel()
@@ -7925,6 +8181,14 @@ policy: {policy}
                     await placeholder_task
             # 清理缓冲区
             self._stream_buffers.pop(session_key, None)
+            # 补发 _streaming_end，确保渠道清理流式状态（如飞书的 _streaming_message_ids）
+            with contextlib.suppress(Exception):
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="",
+                    metadata={"_streaming_end": True, **self._build_reply_metadata(msg)},
+                ))
             raise e
 
     async def process_direct(

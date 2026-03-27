@@ -261,7 +261,13 @@ class ACPClient:
                 logger.warning("ACP WebSocket connection closed, will reconnect on next request")
                 self._connected = False
                 self._initialized = False
-                # 不跳出循环，等待下次请求时重连
+                # 主动 fail 所有等待中的请求，避免它们等到超时
+                for req_id, future in list(self._pending_requests.items()):
+                    if not future.done():
+                        future.set_exception(
+                            ACPConnectionError("WebSocket connection closed")
+                        )
+                self._pending_requests.clear()
                 break
             except json.JSONDecodeError as e:
                 logger.debug(f"ACP JSON decode error: {e}")
@@ -326,8 +332,9 @@ class ACPClient:
             return response.get("result", {})
             
         except asyncio.TimeoutError:
-            self._pending_requests.pop(request_id, None)
             raise ACPTimeoutError(f"ACP request timeout: {method}")
+        finally:
+            self._pending_requests.pop(request_id, None)
     
     async def initialize(self) -> dict:
         """
@@ -957,8 +964,8 @@ class ACPAdapter:
             self._client = None
     
     def _get_session_key(self, channel: str, chat_id: str) -> str:
-        """获取会话键。"""
-        return f"{channel}:{chat_id}"
+        """获取会话键 — 所有渠道共享同一个 session。"""
+        return "unified:default"
 
     @staticmethod
     def _inject_history_before_user_message(message: str, history_context: str) -> str:
@@ -1054,6 +1061,48 @@ class ACPAdapter:
         ]
         return any(keyword in text for keyword in keywords)
     
+    # Session 健康阈值：当上下文使用超过此比例时，自动创建新 session
+    _SESSION_USAGE_THRESHOLD = 0.70  # 70%
+
+    def _check_session_health(self, session_id: str) -> bool:
+        """检查 session 是否健康（未超过上下文阈值）。
+
+        Returns:
+            True 表示健康可用，False 表示需要替换。
+        """
+        session_file = Path.home() / ".iflow" / "acp" / "sessions" / f"{session_id}.json"
+        if not session_file.exists():
+            return True  # 文件不存在，可能是新 session
+        try:
+            size_bytes = session_file.stat().st_size
+            estimated_tokens = int(size_bytes / 3.5)
+            model_name = self.default_model or "claude-opus-4-6"
+            # 模型上下文容量映射（与 loop.py 中的 _MODEL_CONTEXT_LIMITS 保持一致）
+            context_limits = {
+                "claude-opus-4": 200000,
+                "claude-sonnet-4": 200000,
+                "claude-haiku-4": 200000,
+                "claude-opus-4-6": 200000,
+            }
+            max_tokens = 200000  # 默认值
+            for prefix, limit in context_limits.items():
+                if model_name.startswith(prefix):
+                    max_tokens = limit
+                    break
+            usage_ratio = estimated_tokens / max_tokens
+            if usage_ratio >= self._SESSION_USAGE_THRESHOLD:
+                logger.warning(
+                    f"Session {session_id[:16]}... context usage {usage_ratio:.0%} "
+                    f"exceeds threshold {self._SESSION_USAGE_THRESHOLD:.0%} "
+                    f"(~{estimated_tokens} tokens / {max_tokens} max). "
+                    f"Will create new session."
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.debug(f"Session health check failed: {e}")
+            return True  # 检查失败时不阻塞，继续使用
+
     async def _get_or_create_session(
         self,
         channel: str,
@@ -1062,6 +1111,8 @@ class ACPAdapter:
     ) -> str:
         """
         获取或创建会话。
+
+        如果现有 session 的上下文使用超过阈值，自动创建新 session。
         
         Args:
             channel: 渠道名称
@@ -1073,10 +1124,15 @@ class ACPAdapter:
         """
         key = self._get_session_key(channel, chat_id)
         
-        # 如果 session 已存在，直接返回（不尝试 load，因为 ACP session 在服务端保持）
+        # 如果 session 已存在，检查健康状态
         if key in self._session_map:
-            logger.debug(f"Reusing existing session: {key} -> {self._session_map[key][:16]}...")
-            return self._session_map[key]
+            session_id = self._session_map[key]
+            if self._check_session_health(session_id):
+                logger.debug(f"Reusing existing session: {key} -> {session_id[:16]}...")
+                return session_id
+            # session 不健康，移除旧映射，创建新 session
+            logger.info(f"Replacing unhealthy session: {key} -> {session_id[:16]}...")
+            del self._session_map[key]
         
         return await self._create_new_session(key, model)
     

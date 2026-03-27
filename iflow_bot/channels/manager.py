@@ -4,17 +4,15 @@
 """
 
 import asyncio
-import logging
 from typing import Optional, Type
+
+from loguru import logger
 
 from iflow_bot.bus.events import OutboundMessage
 from iflow_bot.bus.queue import MessageBus
 from iflow_bot.config.schema import Config
 
 from .base import BaseChannel
-
-
-logger = logging.getLogger(__name__)
 
 
 # Channel 注册表 - 存储渠道名称到 Channel 类的映射
