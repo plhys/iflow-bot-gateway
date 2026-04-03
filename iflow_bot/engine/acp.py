@@ -964,8 +964,10 @@ class ACPAdapter:
             self._client = None
     
     def _get_session_key(self, channel: str, chat_id: str) -> str:
-        """获取会话键 — 所有渠道共享同一个 session。"""
-        return "unified:default"
+        """获取会话键 — 心跳使用独立 session，其余按通道隔离。"""
+        if chat_id == "heartbeat":
+            return "heartbeat:default"
+        return f"{channel}:{chat_id or 'default'}"
 
     @staticmethod
     def _inject_history_before_user_message(message: str, history_context: str) -> str:

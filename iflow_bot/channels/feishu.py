@@ -38,15 +38,24 @@ try:
         CreateMessageReactionRequest,
         CreateMessageReactionRequestBody,
         Emoji,
+        FollowUp,
         GetMessageResourceRequest,
         PatchMessageRequest,
         PatchMessageRequestBody,
+        PushFollowUpMessageRequest,
+        PushFollowUpMessageRequestBody,
         P2ImChatAccessEventBotP2pChatEnteredV1,
         P2ImMessageMessageReadV1,
         P2ImMessageRecalledV1,
         P2ImMessageReceiveV1,
         P2ImMessageReactionCreatedV1,
         P2ImMessageReactionDeletedV1,
+    )
+    from lark_oapi.api.speech_to_text.v1 import (
+        FileRecognizeSpeechRequest,
+        FileRecognizeSpeechRequestBody,
+        FileConfig,
+        Speech,
     )
     FEISHU_AVAILABLE = True
 except ImportError:
@@ -646,8 +655,6 @@ class FeishuChannel(BaseChannel):
         if exec_info.is_thinking or has_reasoning:
             # Thinking header line
             parts: list[str] = []
-            if exec_info.model_name:
-                parts.append(f"<font color='blue'>{exec_info.model_name}</font>")
             percent = exec_info.content_left_percent if exec_info.content_left_percent is not None else 100
             parts.append(f"<font color='grey'>剩余 {percent}%</font>")
 
@@ -672,8 +679,6 @@ class FeishuChannel(BaseChannel):
 
         # --- Response section ---
         response_parts: list[str] = []
-        if exec_info.model_name:
-            response_parts.append(f"<font color='blue'>{exec_info.model_name}</font>")
         percent = exec_info.content_left_percent if exec_info.content_left_percent is not None else 100
         response_parts.append(f"<font color='grey'>剩余 {percent}%</font>")
 
@@ -697,7 +702,36 @@ class FeishuChannel(BaseChannel):
 
         # Response content
         if content and content.strip():
+            elements.append({"tag": "hr"})
             elements.extend(self._build_card_elements(content))
+            elements.append({"tag": "hr"})
+
+        # Model name footer (right-aligned small text)
+        if exec_info.model_name:
+            elements.append({
+                "tag": "column_set",
+                "flex_mode": "none",
+                "background_style": "transparent",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "auto",
+                        "elements": [
+                            {
+                                "tag": "markdown",
+                                "content": f"<font color='grey'>当前模型: {exec_info.model_name}</font>",
+                                "text_align": "right",
+                            },
+                        ],
+                    },
+                ],
+            })
 
         return {
             "config": {"wide_screen_mode": True},
@@ -805,10 +839,12 @@ class FeishuChannel(BaseChannel):
     ) -> tuple[Optional[bytes], Optional[str]]:
         """Download a file/audio/media from a Feishu message."""
         try:
+            # Feishu API type param only accepts "image" or "file"
+            api_type = "image" if resource_type == "image" else "file"
             request = GetMessageResourceRequest.builder() \
                 .message_id(message_id) \
                 .file_key(file_key) \
-                .type(resource_type) \
+                .type(api_type) \
                 .build()
             response = self._client.im.v1.message_resource.get(request)
             if response.success():
@@ -873,6 +909,90 @@ class FeishuChannel(BaseChannel):
             return str(file_path), f"[{msg_type}: {filename}]"
 
         return None, f"[{msg_type}: download failed]"
+
+    def _speech_to_text_sync(self, audio_path: str) -> Optional[str]:
+        """Convert audio file to text using Feishu speech_to_text API.
+
+        Args:
+            audio_path: Path to the audio file (.opus, .wav, .mp3, etc.)
+
+        Returns:
+            Recognized text, or None if failed
+        """
+        import base64
+        try:
+            audio_data = Path(audio_path).read_bytes()
+            speech_b64 = base64.standard_b64encode(audio_data).decode("utf-8")
+
+            ext = Path(audio_path).suffix.lstrip(".")
+            fmt = ext if ext else "opus"
+
+            request = FileRecognizeSpeechRequest.builder().request_body(
+                FileRecognizeSpeechRequestBody.builder()
+                .speech(Speech.builder().speech(speech_b64).build())
+                .config(
+                    FileConfig.builder()
+                    .file_id(Path(audio_path).name)
+                    .format(fmt)
+                    .engine_type("16k_auto")
+                    .build()
+                )
+                .build()
+            ).build()
+
+            response = self._client.speech_to_text.v1.speech.file_recognize(request)
+            if response.success():
+                text = response.data.recognition_text if response.data else None
+                if text:
+                    logger.info(f"STT success: {Path(audio_path).name} -> {len(text)} chars")
+                    return text
+                logger.warning(f"STT returned empty text for {audio_path}")
+                return None
+            else:
+                logger.error(
+                    f"STT failed: code={response.code}, msg={response.msg}, "
+                    f"log_id={response.get_log_id()}"
+                )
+                return None
+        except Exception as e:
+            logger.error(f"STT error for {audio_path}: {e}")
+            return None
+
+    def _push_follow_up_sync(self, message_id: str, suggestions: list[str]) -> bool:
+        """Push follow-up suggestions for a bot message.
+
+        Args:
+            message_id: The bot message ID to attach suggestions to
+            suggestions: List of suggestion texts (max 10, each max 200 chars)
+
+        Returns:
+            True if successful
+        """
+        try:
+            follow_ups = [
+                FollowUp.builder().content(text[:200]).build()
+                for text in suggestions[:10]
+            ]
+            request = PushFollowUpMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    PushFollowUpMessageRequestBody.builder()
+                    .follow_ups(follow_ups)
+                    .build()
+                ).build()
+
+            response = self._client.im.v1.message.push_follow_up(request)
+            if response.success():
+                logger.debug(f"Push follow_up OK: {message_id}, {len(suggestions)} suggestions")
+                return True
+            else:
+                logger.warning(
+                    f"Push follow_up failed: code={response.code}, msg={response.msg}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Push follow_up error: {e}")
+            return False
 
     def _send_message_sync(
         self, receive_id_type: str, receive_id: str, msg_type: str, content: str
@@ -1025,6 +1145,13 @@ class FeishuChannel(BaseChannel):
                     message_id,
                     content_len,
                 )
+                # Push follow-up suggestions after final streaming patch
+                if is_final:
+                    suggestions = (msg.metadata or {}).get("follow_up_suggestions")
+                    if suggestions and isinstance(suggestions, list):
+                        await loop.run_in_executor(
+                            None, self._push_follow_up_sync, message_id, suggestions
+                        )
                 return
             self._streaming_message_ids.pop(stream_key, None)
             logger.warning(
@@ -1227,20 +1354,37 @@ class FeishuChannel(BaseChannel):
             if msg.content and msg.content.strip():
                 if msg.metadata.get("_error"):
                     card = self._build_error_card(msg.content)
+                    await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, self._send_message_sync,
+                            receive_id_type, msg.chat_id, "interactive",
+                            json.dumps(card, ensure_ascii=False),
+                        ),
+                        timeout=self._API_TIMEOUT,
+                    )
                 else:
                     final_wall_ms = None
                     start_t = self._streaming_start_time.get(msg.chat_id)
                     if start_t:
                         final_wall_ms = int((time.time() - start_t) * 1000)
                     card = self._build_rich_card(msg.content, msg.execution_info, wall_clock_ms=final_wall_ms)
-                await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None, self._send_message_sync,
-                        receive_id_type, msg.chat_id, "interactive",
-                        json.dumps(card, ensure_ascii=False),
-                    ),
-                    timeout=self._API_TIMEOUT,
-                )
+                    sent_msg_id = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, self._send_message_sync,
+                            receive_id_type, msg.chat_id, "interactive",
+                            json.dumps(card, ensure_ascii=False),
+                        ),
+                        timeout=self._API_TIMEOUT,
+                    )
+
+                    # Push follow-up suggestions for completed (non-streaming) replies
+                    is_done = msg.execution_info and not msg.execution_info.is_generating and not msg.execution_info.is_thinking
+                    if sent_msg_id and is_done:
+                        suggestions = msg.metadata.get("follow_up_suggestions")
+                        if suggestions and isinstance(suggestions, list):
+                            await loop.run_in_executor(
+                                None, self._push_follow_up_sync, sent_msg_id, suggestions
+                            )
 
         except Exception as e:
             # 清理可能残留的流式状态，防止内存泄漏
@@ -1403,9 +1547,23 @@ class FeishuChannel(BaseChannel):
                 file_path, content_text = await self._download_and_save_media(
                     msg_type, content_json, message_id
                 )
-                if file_path:
+                if file_path and msg_type == "audio":
+                    # Try speech-to-text for audio messages
+                    loop = asyncio.get_running_loop()
+                    recognized = await loop.run_in_executor(
+                        None, self._speech_to_text_sync, file_path
+                    )
+                    if recognized:
+                        content_parts.append(f"[语音转文字] {recognized}")
+                    else:
+                        # STT failed, still pass file path for reference
+                        media_paths.append(file_path)
+                        content_parts.append(content_text)
+                elif file_path:
                     media_paths.append(file_path)
-                content_parts.append(content_text)
+                    content_parts.append(content_text)
+                else:
+                    content_parts.append(content_text)
 
             elif msg_type in ("share_chat", "share_user", "interactive",
                             "share_calendar_event", "system", "merge_forward"):

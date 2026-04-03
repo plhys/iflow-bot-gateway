@@ -7389,8 +7389,8 @@ policy: {policy}
             logger.exception("Unhandled exception in _process_message task")
 
     def _get_user_lock(self, channel: str, chat_id: str) -> asyncio.Lock:
-        """获取统一会话锁（跨渠道共享 session，必须串行处理）。"""
-        key = "unified:default"
+        """获取会话锁（按通道隔离，同通道内串行处理）。"""
+        key = f"{channel}:{chat_id or 'default'}"
         if key not in self._user_locks:
             self._user_locks[key] = asyncio.Lock()
         return self._user_locks[key]
@@ -7721,6 +7721,33 @@ policy: {policy}
             # 这里不发新消息，避免创建新卡片导致后续回复错位
             raise
         except Exception as e:
+            error_str = str(e)
+            # Prompt timeout 自动重试一次
+            if "Prompt timeout" in error_str and not getattr(msg, '_retried', False):
+                logger.warning(f"Prompt timeout for {msg.channel}:{msg.chat_id}, retrying once...")
+                msg._retried = True
+                try:
+                    if supports_streaming:
+                        response = await self._process_with_streaming(msg, message_content)
+                    else:
+                        response = await self.adapter.chat(
+                            message=message_content,
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            model=self.model,
+                        )
+                    if response and not supports_streaming:
+                        outbound = self._analyze_and_build_outbound(
+                            response=response,
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            metadata=self._build_reply_metadata(msg),
+                        )
+                        await self.bus.publish_outbound(outbound)
+                    return
+                except Exception as retry_e:
+                    logger.exception(f"Retry also failed for {msg.channel}:{msg.chat_id}")
+                    e = retry_e
             logger.exception(f"Error processing message for {msg.channel}:{msg.chat_id}")  # B6
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel,
@@ -7851,7 +7878,7 @@ policy: {policy}
                     if mapping_file.exists():
                         with open(mapping_file, "r", encoding="utf-8") as mf:
                             mappings = json.load(mf)
-                        sid = mappings.get("unified:default")
+                        sid = mappings.get(f"{channel}:{chat_id or 'default'}")
                         if sid:
                             estimated = _estimate_content_left_from_session(sid, model_name)
                             if estimated is not None:
@@ -8045,8 +8072,8 @@ policy: {policy}
                         if mapping_file.exists():
                             with open(mapping_file, "r", encoding="utf-8") as mf:
                                 mappings = json.load(mf)
-                            # ACP unified session key
-                            sid = mappings.get("unified:default")
+                            # ACP session key per channel
+                            sid = mappings.get(f"{msg.channel}:{msg.chat_id or 'default'}")
                             if sid:
                                 estimated = _estimate_content_left_from_session(sid, model_name)
                                 if estimated is not None:
@@ -8101,6 +8128,7 @@ policy: {policy}
                             metadata={
                                 "_progress": True,
                                 "_streaming": True,
+                                "follow_up_suggestions": ["继续", "换个话题"],
                                 **self._build_reply_metadata(msg),
                             },
                             execution_info=final_exec_info,

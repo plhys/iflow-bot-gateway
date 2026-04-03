@@ -1238,7 +1238,24 @@ def create_app(token: str | None = None) -> FastAPI:
     app = FastAPI(title="iflow-bot Console", version="1.0.0")
 
     base_dir = Path(__file__).parent
-    templates = Jinja2Templates(directory=str(base_dir / "templates"))
+    _templates = Jinja2Templates(directory=str(base_dir / "templates"))
+
+    class _CompatTemplates:
+        """Wrap Jinja2Templates to accept both old and new TemplateResponse signatures."""
+
+        def __getattr__(self, name: str):
+            return getattr(_templates, name)
+
+        def TemplateResponse(self, name_or_request, context_or_name=None, context=None, **kw):
+            # Old style: TemplateResponse("name.html", {"request": req, ...}, **kw)
+            if isinstance(name_or_request, str):
+                ctx = context_or_name or {}
+                req = ctx.pop("request", None)
+                return _templates.TemplateResponse(req, name_or_request, ctx, **kw)
+            # New style: TemplateResponse(request, "name.html", context, **kw)
+            return _templates.TemplateResponse(name_or_request, context_or_name, context, **kw)
+
+    templates = _CompatTemplates()
     app.mount("/static", StaticFiles(directory=str(base_dir / "static")), name="static")
 
     class _WebConsoleLogHandler(logging.Handler):
